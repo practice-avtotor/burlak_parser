@@ -453,10 +453,64 @@ def parse_card_file(
             if first_table_info is None:
                 # Fallback: Changan-формат с 图示编号 (Graphic Number)
                 header_rows = HeuristicAnalyzer.find_header_rows(ws)
-                col_types = HeuristicAnalyzer.detect_column_types(ws, header_rows) if header_rows else {}
+                col_types = HeuristicAnalyzer.detect_column_types(
+                    ws, header_rows, allow_qty_fallback=True,
+                ) if header_rows else {}
+
+                # Путь 1: Changan с graphic_number колонкой
                 graphic_parts = _collect_parts_with_graphic_number(
                     ws, max_row, max_col, header_rows, col_types, basename,
                 )
+
+                # Путь 2: Если graphic_number не найден — прямое извлечение
+                # по part_no + qty колонкам (если они определены)
+                if not graphic_parts:
+                    part_no_col = col_types.get("part_no", 0)
+                    qty_col = col_types.get("qty", 0)
+                    name_col = col_types.get("name_cn", 0) or col_types.get("name_en", 0)
+
+                    # Fallback: ищем part_no по содержимому если не нашли по заголовку
+                    data_start = header_rows[-1] + 1 if header_rows else 2
+                    if part_no_col == 0:
+                        part_no_col = HeuristicAnalyzer._find_part_no_by_content(
+                            ws, data_start, max_row + 1, max_col,
+                        )
+                    if qty_col == 0:
+                        known = set()
+                        if part_no_col > 0:
+                            known.add(part_no_col)
+                        if name_col > 0:
+                            known.add(name_col)
+                        # Собираем тексты заголовков для исключения meta-колонок
+                        header_texts_changan: Dict[int, str] = {}
+                        for c in range(1, min(max_col + 1, 50)):
+                            for hr in header_rows:
+                                v = ws.cell_value(hr, c)
+                                if v is not None:
+                                    header_texts_changan[c] = str(v).strip().lower()
+                                    break
+                        qty_col = HeuristicAnalyzer._find_qty_by_content(
+                            ws, data_start, max_row + 1, max_col,
+                            header_texts=header_texts_changan,
+                            known_cols=known,
+                        )
+
+                    logger.debug(
+                        "Sheet '%s' Direct fallback: part_no=%d, qty=%d, name=%d",
+                        sheet_name, part_no_col, qty_col, name_col,
+                    )
+
+                    if part_no_col > 0:
+                        raw_rows = _collect_raw_rows(
+                            ws, data_start - 1, max_row, max_col,
+                            part_no_col, qty_col, name_col, basename,
+                        )
+                        merged_parts = _merge_multiline_part_numbers(raw_rows)
+                        if merged_parts:
+                            graphic_parts = [
+                                (pn, qty, name, "") for pn, qty, name, _ in merged_parts
+                            ]
+
                 if graphic_parts:
                     tables_extracted += 1
                     for part_no, qty, name, graphic_number in graphic_parts:
@@ -471,7 +525,7 @@ def parse_card_file(
                     sheets_info.append(CardSheetInfo(
                         card_number=card_number or basename,
                         sheet_name=sheet_name,
-                        operation_name=f"Graphic number linked ({len(graphic_parts)} parts)",
+                        operation_name=f"Changan fallback ({len(graphic_parts)} parts)",
                         is_valid=True,
                         has_data=True,
                         max_data_row=max_row,
@@ -506,6 +560,31 @@ def parse_card_file(
                 continue
 
             header_row, part_no_col, qty_col, name_col = first_table_info
+
+            # ── Fallback: если find_part_table не нашёл qty — ищем по содержимому ──
+            if qty_col == 0:
+                data_start = header_row + 1
+                known = set()
+                if part_no_col > 0:
+                    known.add(part_no_col)
+                if name_col > 0:
+                    known.add(name_col)
+                # Собираем тексты заголовков для исключения meta-колонок
+                header_texts: Dict[int, str] = {}
+                for c in range(1, min(max_col + 1, 50)):
+                    v = ws.cell_value(header_row, c)
+                    if v is not None:
+                        header_texts[c] = str(v).strip().lower()
+                qty_col = HeuristicAnalyzer._find_qty_by_content(
+                    ws, data_start, max_row + 1, max_col,
+                    header_texts=header_texts,
+                    known_cols=known,
+                )
+                if qty_col > 0:
+                    logger.debug(
+                        "Sheet '%s': qty_col=%d found by content fallback (header_row=%d)",
+                        sheet_name, qty_col, header_row,
+                    )
 
             # Извлекаем название операции
             operation_name = HeuristicAnalyzer.extract_operation_name(ws, header_row)
@@ -727,7 +806,16 @@ def _collect_raw_rows(
                 try:
                     qty = float(raw_qty) if raw_qty is not None else 0.0
                 except (ValueError, TypeError):
+                    # Извлекаем число из строки ("1个" → 1.0, "2pcs" → 2.0)
                     qty = 0.0
+                    if raw_qty is not None:
+                        import re
+                        m = re.match(r'^\s*(\d+(?:[.,]\d+)?)', str(raw_qty).strip())
+                        if m:
+                            try:
+                                qty = float(m.group(1).replace(",", "."))
+                            except ValueError:
+                                qty = 0.0
             else:
                 qty = 0.0
 
@@ -778,6 +866,25 @@ def _collect_all_tables(
         # Если заголовок уже обработан — выходим
         if header_row < start_search:
             break
+
+        # ── Fallback: если find_part_table не нашёл qty — ищем по содержимому ──
+        if qty_col == 0:
+            data_start = header_row + 1
+            known = set()
+            if part_no_col > 0:
+                known.add(part_no_col)
+            if name_col > 0:
+                known.add(name_col)
+            header_texts_tbl: Dict[int, str] = {}
+            for c in range(1, min(max_col + 1, 50)):
+                v = ws.cell_value(header_row, c)
+                if v is not None:
+                    header_texts_tbl[c] = str(v).strip().lower()
+            qty_col = HeuristicAnalyzer._find_qty_by_content(
+                ws, data_start, max_row + 1, max_col,
+                header_texts=header_texts_tbl,
+                known_cols=known,
+            )
 
         raw_rows = _collect_raw_rows(
             ws, header_row, max_row, max_col,
@@ -843,13 +950,39 @@ def _collect_parts_with_graphic_number(
     part_no_col = col_types.get("part_no", 0)
     name_col = col_types.get("name_cn", 0) or col_types.get("name_en", 0)
 
+    data_start = header_rows[-1] + 1 if header_rows else 2
+
+    # Fallback: ищем part_no по содержимому если не нашли по заголовку
     if part_no_col == 0:
-        return []
+        part_no_col = HeuristicAnalyzer._find_part_no_by_content(
+            ws, data_start, max_row + 1, max_col,
+        )
+        if part_no_col == 0:
+            logger.debug(
+                "Graphic number extraction: part_no column not found "
+                "(col_types=%s, graphic_col=%d)",
+                col_types, graphic_col,
+            )
+            return []
 
     # Находим количественную колонку (qty или config columns)
     qty_col = col_types.get("qty", 0)
 
-    data_start = header_rows[-1] + 1 if header_rows else 2
+    # Fallback: ищем qty по содержимому если не нашли по заголовку
+    if qty_col == 0:
+        known = {graphic_col, part_no_col}
+        if name_col > 0:
+            known.add(name_col)
+        qty_col = HeuristicAnalyzer._find_qty_by_content(
+            ws, data_start, max_row + 1, max_col,
+            known_cols=known,
+        )
+        if qty_col > 0:
+            logger.debug(
+                "Graphic number extraction: qty column found by content: %d",
+                qty_col,
+            )
+
     parts: List[Tuple[str, float, str, str]] = []
 
     for r in range(data_start, max_row + 1):

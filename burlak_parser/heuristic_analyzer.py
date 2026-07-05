@@ -358,6 +358,10 @@ def looks_like_quantity(value: Any) -> float:
         return 0.9
     except ValueError:
         pass
+    # Строка вида "1个", "2pcs", "3 шт" — начинается с числа
+    import re
+    if re.match(r'^\d+[\s]*\S', s):
+        return 0.85
     # 'S' или '-' — возможные значения VIN-разбивки
     if s.upper() == "S" or s == "-":
         return 0.2  # Не количество, а "такая же"
@@ -579,7 +583,7 @@ class HeuristicAnalyzer:
         return score / max_possible
 
     @staticmethod
-    def detect_column_types(ws: Any, header_rows: List[int]) -> Dict[str, int]:
+    def detect_column_types(ws: Any, header_rows: List[int], *, allow_qty_fallback: bool = False) -> Dict[str, int]:
         """Определить типы колонок на основе заголовков и содержимого.
 
         Анализирует заголовки и проверяет типы данных в ячейках.
@@ -784,6 +788,15 @@ class HeuristicAnalyzer:
             name_col = HeuristicAnalyzer._find_name_by_content(ws, data_start, sample_end, max_col)
             if name_col:
                 col_types['name_cn'] = name_col
+
+        # Фазя 4b: Fallback для qty по содержимому (только для операционных карт)
+        if 'qty' not in col_types and allow_qty_fallback:
+            known = {v for v in col_types.values() if v > 0}
+            qty_col = HeuristicAnalyzer._find_qty_by_content(
+                ws, data_start, sample_end, max_col, header_texts, known,
+            )
+            if qty_col:
+                col_types['qty'] = qty_col
 
         # Фаза 5: Если name_en найден, но контент — русский/китайский → переназначаем в name_cn
         # (но только если заголовок НЕ содержит явных английских маркеров)
@@ -1124,6 +1137,122 @@ class HeuristicAnalyzer:
             best = max(col_scores, key=col_scores.get)
             if col_scores[best] > 0.2:
                 logger.info("Колонка name найдена по содержимому: %d (score=%.2f)", best, col_scores[best])
+                return best
+        return 0
+
+    @staticmethod
+    def _find_qty_by_content(
+        ws: Any, start_row: int, end_row: int, max_col: int,
+        header_texts: Optional[Dict[int, str]] = None,
+        known_cols: Optional[Set[int]] = None,
+    ) -> int:
+        """Fallback: найти колонку количества по содержимому ячеек.
+
+        Анализирует содержимое всех неизвестных колонок и ищет ту,
+        где большинство значений похожи на количество (числа, дроби).
+
+        Используется когда keyword-based детекция не нашла qty колонку
+        (характерно для Changan-формата).
+
+        Args:
+            ws: Лист Excel.
+            start_row: Начальная строка данных.
+            end_row: Конечная строка данных.
+            max_col: Максимальная колонка.
+            header_texts: Тексты заголовков (для исключения мета-колонок).
+            known_cols: Уже определённые колонки (part_no, name и т.д.).
+
+        Returns:
+            Номер колонки или 0.
+        """
+        if known_cols is None:
+            known_cols = set()
+
+        col_scores: Dict[int, float] = {}
+
+        for c in range(1, max_col + 1):
+            if c in known_cols:
+                continue
+
+            # Исключаем колонки с мета-заголовками
+            if header_texts:
+                text = header_texts.get(c, "")
+                if text:
+                    is_meta = False
+                    for kw in STRICT_META_KEYWORDS:
+                        if kw.lower() in text:
+                            is_meta = True
+                            break
+                    if not is_meta:
+                        for kw in META_KEYWORDS:
+                            if kw.lower() in text:
+                                is_meta = True
+                                break
+                    if is_meta:
+                        continue
+
+            # Собираем непустые значения
+            values: List[Any] = []
+            for r in range(start_row, end_row):
+                v = HeuristicAnalyzer.get_cell_value(ws, r, c)
+                if v is not None:
+                    values.append(v)
+
+            if len(values) < 3:
+                continue
+
+            # Исключаем boolean-подобные колонки (и 0 и 1) — это колонки комплектаций.
+            # НЕ исключаем колонки только с 1 (обычное количество = 1 для каждой детали).
+            numeric_vals: List[float] = []
+            for v in values:
+                if isinstance(v, (int, float)):
+                    numeric_vals.append(float(v))
+                elif isinstance(v, str) and v.strip():
+                    try:
+                        numeric_vals.append(float(v.strip().replace(",", ".")))
+                    except (ValueError, TypeError):
+                        pass
+            if numeric_vals:
+                unique_nums = set(numeric_vals)
+                # Пропускаем только если присутствуют ОБА 0 и 1 (boolean config)
+                if unique_nums == {0.0, 1.0}:
+                    continue
+
+            # Считаем qty-хиты и исключаем part_no/name колонки
+            qty_hits = 0
+            pn_hits = 0
+            nm_hits = 0
+            for v in values:
+                qt = looks_like_quantity(v)
+                if qt > 0.8:
+                    qty_hits += 1
+                if looks_like_part_number(v) > 0.6:
+                    pn_hits += 1
+                if looks_like_name(v) > 0.5:
+                    nm_hits += 1
+
+            total = len(values)
+            qty_ratio = qty_hits / total
+            pn_ratio = pn_hits / total
+            nm_ratio = nm_hits / total
+
+            # Qty колонка: >30% числовых значений, но НЕ part_no и НЕ name
+            if qty_ratio > 0.3 and pn_ratio < 0.3 and nm_ratio < 0.3:
+                # Бонус за наличие дробных значений (отличие от sequence number)
+                has_fraction = any(
+                    isinstance(v, float) and v != int(v)
+                    for v in values if isinstance(v, (int, float))
+                )
+                fraction_bonus = 0.1 if has_fraction else 0.0
+                col_scores[c] = qty_ratio + fraction_bonus
+
+        if col_scores:
+            best = max(col_scores, key=col_scores.get)
+            if col_scores[best] > 0.3:
+                logger.info(
+                    "Колонка qty найдена по содержимому: %d (score=%.2f)",
+                    best, col_scores[best],
+                )
                 return best
         return 0
 
